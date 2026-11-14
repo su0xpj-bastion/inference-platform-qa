@@ -25,6 +25,7 @@ from inferqa.probe import stream_chat
 
 NS = os.environ.get("INFERENCE_NS", "inference")
 INGRESS_URL = os.environ.get("INGRESS_URL", "http://localhost:8080")
+INGRESS_SYNC_BUDGET_S = 10.0  # must be < preStop (5s) + drain grace (10s)
 HOST_HEADER = {"Host": os.environ.get("INGRESS_HOST", "inference.local")}
 
 pytestmark = [
@@ -95,15 +96,31 @@ def test_ingress_does_not_buffer_sse(client):
 
 
 def test_not_ready_pod_leaves_rotation(client):
-    """Readiness gating: a pod failing /readyz is removed from EndpointSlices and gets no traffic."""
+    """Readiness gating: a pod failing /readyz leaves EndpointSlices, then ingress stops routing to it
+    within INGRESS_SYNC_BUDGET_S.
+
+    The two steps are separately asserted because they are separately eventual: CI run 43620786802
+    showed ingress-nginx still routing to the pod after EndpointSlices had already dropped it. The
+    budget must stay below preStop + drain grace (15s), or rolling restarts will drop requests.
+    """
     victim = ready_pods()[0]
     kubectl("exec", victim, "--", "python", "-c",
             "import urllib.request as u;u.urlopen(u.Request('http://127.0.0.1:8000/admin/ready',"
             "data=b'{\"ready\":false}',method='POST'))")
+    flipped = time.monotonic()
     try:
         wait_until(lambda: endpoint_addresses() == 2, timeout=30)
-        seen = Counter(stream_chat(client, "ping").served_by for _ in range(20))
-        assert victim not in seen
+        k8s_lag = time.monotonic() - flipped
+
+        def ingress_excludes_victim() -> bool:
+            """ingress-nginx stopped routing to the not-ready pod"""
+            return victim not in {stream_chat(client, "ping").served_by for _ in range(9)}
+
+        wait_until(ingress_excludes_victim, timeout=INGRESS_SYNC_BUDGET_S, step=0.2)
+        ingress_lag = time.monotonic() - flipped
+        print(f"[LAG] readiness->EndpointSlice {k8s_lag:.1f}s, readiness->ingress {ingress_lag:.1f}s")
+        # Converged, not flapping: it must stay out.
+        assert victim not in Counter(stream_chat(client, "ping").served_by for _ in range(30))
     finally:
         kubectl("delete", "pod", victim, "--wait=false")
 
