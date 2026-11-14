@@ -32,7 +32,10 @@ spec:
           env:
             - name: REPLICA_ID
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
-            - {name: MOCKSERVE_DRAIN_S, value: "20"}
+            # Budget (must stay < terminationGracePeriodSeconds 30):
+            #   preStop 5s + keep-accepting 10s + in-flight drain up to 10s = 25s
+            - {name: MOCKSERVE_DRAIN_GRACE_S, value: "10"}
+            - {name: MOCKSERVE_DRAIN_S, value: "10"}
           readinessProbe:
             httpGet: {path: /readyz, port: http}
             periodSeconds: 2

@@ -82,8 +82,8 @@ def test_midstream_failure_is_not_replayed(testbed):
 
 
 def test_sigterm_drains_inflight_stream(testbed):
-    """Rolling deploy: pod gets SIGTERM mid-stream. The stream must finish; new work must go elsewhere."""
-    slow = spawn_replica("draining", MOCKSERVE_TBT_MS="30")
+    """Rolling deploy: pod gets SIGTERM mid-stream. The stream must finish and the process exits 0."""
+    slow = spawn_replica("draining", MOCKSERVE_TBT_MS="30", MOCKSERVE_DRAIN_GRACE_S="0.5")
     testbed.extra.append(slow)
     client = openai.OpenAI(base_url=f"{slow.url}/v1", api_key="t", max_retries=0)
     result = {}
@@ -102,6 +102,54 @@ def test_sigterm_drains_inflight_stream(testbed):
     assert r.ok and r.timing.tokens == 30 and r.finish_reason == "stop"
     slow.proc.wait(5)
     assert slow.proc.returncode == 0
+
+
+def test_late_traffic_during_drain_grace_is_served():
+    """Endpoint removal is async: a request that lands after SIGTERM must still succeed, not 503.
+
+    Regression for CI run 43620047560, where ingress-nginx sent 2 of 300 requests to a
+    pod that had already received SIGTERM, and the pod refused them.
+    """
+    pod = spawn_replica("late", MOCKSERVE_DRAIN_GRACE_S="1.5")
+    try:
+        client = openai.OpenAI(base_url=f"{pod.url}/v1", api_key="t", max_retries=0)
+        pod.term()
+        time.sleep(0.2)
+        assert http_json("GET", f"{pod.url}/readyz")[0] == 503   # out of rotation...
+        assert stream_chat(client, "still here").ok                # ...but still serving
+        metrics = urllib.request.urlopen(f"{pod.url}/metrics", timeout=2).read().decode()
+        assert 'mockserve_served_while_draining_total{replica="late"} 1' in metrics
+        pod.proc.wait(5)
+        assert pod.proc.returncode == 0
+    finally:
+        if pod.proc.poll() is None:
+            pod.kill()
+
+
+def test_rolling_replace_behind_proxy_is_zero_error(testbed):
+    """Local analog of `kubectl rollout restart` (maxSurge 1, maxUnavailable 0) under load: zero errors.
+
+    For each old pod: add a new pod, SIGTERM the old one, and only drop it from the proxy's
+    peer list 0.5s later, which simulates EndpointSlice propagation lag. Traffic in that window
+    must still be served (drain grace), never refused.
+    """
+    ups = testbed.lb_server.RequestHandlerClass.upstreams
+    results = {}
+    t = threading.Thread(target=lambda: results.setdefault("r", run_load(testbed.client(), n=300, concurrency=6)))
+    t.start()
+    for i, old in enumerate(testbed.replicas):
+        new = spawn_replica(f"v2-{i}")
+        testbed.extra.append(new)
+        with ups.lock:
+            ups.peers.append(f"127.0.0.1:{new.port}")
+        old.term()
+        time.sleep(0.5)                                  # endpoint propagation lag
+        with ups.lock:
+            ups.peers.remove(f"127.0.0.1:{old.port}")
+    t.join(60)
+    report = build_report(results["r"])
+    assert report["error_rate"] == 0, report
+    assert any(name.startswith("v2-") for name in report["served_by"]), report["served_by"]
 
 
 def test_not_ready_replica_refuses_admin_toggle(testbed):

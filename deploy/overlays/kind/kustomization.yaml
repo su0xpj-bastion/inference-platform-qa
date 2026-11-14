@@ -7,3 +7,6 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/env/-
         value: {name: MOCKSERVE_ALLOW_FAULTS, value: "1"}
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: {name: MOCKSERVE_LOG, value: "1"}

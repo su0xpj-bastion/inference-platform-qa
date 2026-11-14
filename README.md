@@ -38,6 +38,7 @@ flowchart LR
 | Failover | An ejected peer comes back after `fail_timeout` | `test_ejected_replica_returns_after_fail_timeout` |
 | Safety | A POST that reached a pod is **not** replayed after the pod dies mid-stream, so nothing is billed twice | `test_midstream_failure_is_not_replayed` |
 | Lifecycle | SIGTERM: readiness drops to 503, the in-flight stream finishes, and the process exits 0 | `test_sigterm_drains_inflight_stream` |
+| Lifecycle | Traffic that arrives after SIGTERM (endpoint lag) is still served, not refused | `test_late_traffic_during_drain_grace_is_served`, `test_rolling_replace_behind_proxy_is_zero_error` |
 | Lifecycle | Not-ready ≠ not-live: a pod leaves rotation but isn't restarted | `test_not_ready_replica_refuses_admin_toggle` |
 | Discovery (k8s) | EndpointSlices match exactly the Ready pods | `test_endpoints_match_ready_pods` |
 | Discovery (k8s) | A pod that fails `/readyz` leaves the EndpointSlices and stops receiving traffic | `test_not_ready_pod_leaves_rotation` |
@@ -54,7 +55,7 @@ These are failures I've seen in production inference stacks, and the config that
 | The UI freezes and then dumps the whole answer at once | `proxy-buffering: off` + `X-Accel-Buffering: no` | SSE buffering tests |
 | Long generations get cut at 60s | `proxy-read-timeout: 300` | ingress annotation (review in PR) |
 | A rolling deploy drops streams | `maxUnavailable: 0`, `preStop` sleep, SIGTERM drain in the server | `test_rolling_restart_is_zero_error`, `test_sigterm_drains_inflight_stream` |
-| Traffic reaches a pod before Endpoints update | 5s `preStop` covers the gap between Endpoints removal and SIGTERM | rolling-restart test |
+| Traffic still reaches a pod after SIGTERM (Endpoints removal is async) | `preStop` 5s, then the server keeps accepting for 10s more while readiness fails, then closes its listener so late requests get connection-refused, which NGINX retries safely. `mockserve_served_while_draining_total` measures the lag | `test_late_traffic_during_drain_grace_is_served`, CI run 43620047560 (2/300 503s before the fix) |
 | A retry storm double-bills customers | `proxy-next-upstream: error timeout` only, with no `non_idempotent` | `test_midstream_failure_is_not_replayed` |
 | A node drain takes out capacity | PDB `minAvailable: 2` + topology spread | manifests |
 | A failed CI run with no clues | `scripts/collect_diagnostics.sh` dumps pods, EndpointSlices, ingress logs, and events as artifacts | CI `if: failure()` |
@@ -62,7 +63,7 @@ These are failures I've seen in production inference stacks, and the config that
 ## Run it
 
 ```bash
-make venv && make test          # 42 tests: unit + local-testbed integration (~15s)
+make venv && make test          # 44 tests: unit + local-testbed integration (~15s)
 make go                         # Go lbprobe vet + tests
 make smoke                      # testbed up → probe → Go spread gate → load + SLO gate
 make kind && make cluster-test  # needs docker, kind, kubectl

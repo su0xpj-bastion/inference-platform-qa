@@ -28,7 +28,8 @@ Environment
   REPLICA_ID            value of the x-served-by header (default: hostname)
   MOCKSERVE_TTFT_MS     delay before the first token (default 20)
   MOCKSERVE_TBT_MS      delay between tokens (default 2)
-  MOCKSERVE_DRAIN_S     max seconds to wait for in-flight requests on SIGTERM
+  MOCKSERVE_DRAIN_GRACE_S  seconds to keep accepting after SIGTERM (default 2)
+  MOCKSERVE_DRAIN_S     max seconds to wait for in-flight requests after that
 """
 from __future__ import annotations
 
@@ -57,6 +58,7 @@ class ReplicaState:
         self.allow_faults = allow_faults
         self.ready = True
         self.draining = False
+        self.served_while_draining = 0
         self.lock = threading.Lock()
         self.inflight = 0
         self.requests_total: dict[tuple[str, int], int] = {}
@@ -79,6 +81,8 @@ class ReplicaState:
                 ),
                 "# TYPE mockserve_inflight gauge",
                 f'mockserve_inflight{{replica="{self.replica_id}"}} {self.inflight}',
+                "# TYPE mockserve_served_while_draining_total counter",
+                f'mockserve_served_while_draining_total{{replica="{self.replica_id}"}} {self.served_while_draining}',
                 "# TYPE mockserve_tokens_total counter",
                 f'mockserve_tokens_total{{replica="{self.replica_id}"}} {self.tokens_total}',
                 "# TYPE mockserve_ttft_seconds summary",
@@ -86,6 +90,12 @@ class ReplicaState:
                 f'mockserve_ttft_seconds_count{{replica="{self.replica_id}"}} {self.ttft_count}',
             ]
         return "\n".join(lines) + "\n"
+
+
+def log(msg: str) -> None:
+    """Timestamped stdout line; pod logs are the drain timeline in CI diagnostics."""
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int(time.time() * 1000) % 1000:03d}Z"
+    print(f"{ts} {msg}", flush=True)
 
 
 def make_tokens(messages: list[dict], max_tokens: int) -> tuple[list[str], str, int]:
@@ -174,14 +184,16 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, "not_found", f"no route {self.path}")
             return
 
-        if self.state.draining:
-            # A draining pod should already be out of Endpoints; if traffic
-            # still arrives, refuse fast so the LB can retry elsewhere.
-            self._error(503, "service_unavailable", "replica draining", {"connection": "close"})
-            return
-
+        # While draining, keep serving. Endpoint removal propagates to kube-proxy
+        # and ingress-nginx asynchronously, so for a short while traffic can still
+        # arrive after SIGTERM. Refusing it with 503 is a client-visible error that
+        # NGINX will not retry for a POST (CI run 43620047560 caught exactly that).
+        # Count it instead: a non-zero value measures the propagation lag.
         with self.state.lock:
             self.state.inflight += 1
+            if self.state.draining:
+                self.state.served_while_draining += 1
+                log(f"served request while draining (#{self.state.served_while_draining})")
         try:
             self._chat(body)
         finally:
@@ -304,24 +316,33 @@ def main(argv: list[str] | None = None) -> int:
         allow_faults=os.environ.get("MOCKSERVE_ALLOW_FAULTS") == "1",
     )
     drain_s = float(os.environ.get("MOCKSERVE_DRAIN_S", "10"))
+    grace_s = float(os.environ.get("MOCKSERVE_DRAIN_GRACE_S", "2"))
     server = build_server(args.host, args.port, state)
 
     def on_sigterm(_signum: int, _frame: object) -> None:
         # Kubernetes sends SIGTERM, then SIGKILL after terminationGracePeriodSeconds.
-        # Fail readiness first, let in-flight streams finish, then stop.
+        # 1. fail readiness, keep accepting for grace_s (endpoint removal is async)
+        # 2. close the listener: late traffic now gets connect-refused, which
+        #    NGINX safely retries on another pod (proxy_next_upstream error)
+        # 3. wait for in-flight streams, up to drain_s, then exit 0
         state.draining = True
+        log(f"SIGTERM: readiness failing, accepting for {grace_s}s more, inflight={state.inflight}")
 
-        def drain() -> None:
-            deadline = time.monotonic() + drain_s
-            while state.inflight and time.monotonic() < deadline:
-                time.sleep(0.05)
+        def stop_accepting() -> None:
+            time.sleep(grace_s)
             server.shutdown()
 
-        threading.Thread(target=drain, daemon=True).start()
+        threading.Thread(target=stop_accepting, daemon=True).start()
 
     signal.signal(signal.SIGTERM, on_sigterm)
-    print(f"mockserve {state.replica_id} listening on {args.host}:{server.server_address[1]}", flush=True)
+    log(f"mockserve {state.replica_id} listening on {args.host}:{server.server_address[1]}")
     server.serve_forever()
+    server.server_close()
+    log(f"listener closed, waiting for inflight={state.inflight}")
+    deadline = time.monotonic() + drain_s
+    while state.inflight and time.monotonic() < deadline:
+        time.sleep(0.05)
+    log(f"exit: inflight={state.inflight} served_while_draining={state.served_while_draining}")
     return 0
 
 
