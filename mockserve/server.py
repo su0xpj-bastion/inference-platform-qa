@@ -13,6 +13,7 @@ Endpoints
   GET  /readyz                readiness: 503 while draining or forced down
   GET  /metrics               Prometheus text format
   POST /admin/ready           {"ready": false} flips readiness (faults only)
+  GET  /debug/spans?trace_id= spans this replica recorded for a W3C trace id
 
 Fault injection (only when MOCKSERVE_ALLOW_FAULTS=1)
 ----------------------------------------------------
@@ -30,6 +31,10 @@ Environment
   MOCKSERVE_TBT_MS      delay between tokens (default 2)
   MOCKSERVE_DRAIN_GRACE_S  seconds to keep accepting after SIGTERM (default 2)
   MOCKSERVE_DRAIN_S     max seconds to wait for in-flight requests after that
+  MOCKSERVE_SCHEDULER   immediate | fixed-wait | adaptive (default immediate; see sched.py)
+  MOCKSERVE_MAX_BATCH   requests per dispatched batch (default 8)
+  MOCKSERVE_BATCH_WAIT_MS  batch window (default 350)
+  MOCKSERVE_IDLE_GAP_MS    adaptive: dispatch once arrivals are quiet this long (default 5)
 """
 from __future__ import annotations
 
@@ -43,6 +48,10 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+from mockserve.sched import BatchScheduler
+from mockserve.tracing import SpanStore, now, trace_id_of
 
 MODELS = ("llama3.1-8b", "llama-3.3-70b", "qwen-3-32b")
 DEFAULT_MAX_TOKENS = 32
@@ -51,8 +60,13 @@ DEFAULT_MAX_TOKENS = 32
 class ReplicaState:
     """Mutable state shared across handler threads."""
 
-    def __init__(self, replica_id: str, ttft_ms: int, tbt_ms: int, allow_faults: bool) -> None:
+    def __init__(self, replica_id: str, ttft_ms: int, tbt_ms: int, allow_faults: bool,
+                 scheduler: BatchScheduler | None = None) -> None:
         self.replica_id = replica_id
+        self.sched = scheduler or BatchScheduler("immediate")
+        self.spans = SpanStore(f"mockserve/{replica_id}")
+        self.sched_wait_sum = 0.0
+        self.sched_wait_count = 0
         self.ttft_s = ttft_ms / 1000
         self.tbt_s = tbt_ms / 1000
         self.allow_faults = allow_faults
@@ -88,6 +102,11 @@ class ReplicaState:
                 "# TYPE mockserve_ttft_seconds summary",
                 f'mockserve_ttft_seconds_sum{{replica="{self.replica_id}"}} {self.ttft_sum:.6f}',
                 f'mockserve_ttft_seconds_count{{replica="{self.replica_id}"}} {self.ttft_count}',
+                "# TYPE mockserve_sched_wait_seconds summary",
+                f'mockserve_sched_wait_seconds_sum{{replica="{self.replica_id}",policy="{self.sched.policy}"}} {self.sched_wait_sum:.6f}',
+                f'mockserve_sched_wait_seconds_count{{replica="{self.replica_id}",policy="{self.sched.policy}"}} {self.sched_wait_count}',
+                "# TYPE mockserve_batch_size_mean gauge",
+                f'mockserve_batch_size_mean{{replica="{self.replica_id}"}} {self.sched.mean_batch():.3f}',
             ]
         return "\n".join(lines) + "\n"
 
@@ -157,6 +176,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
+        elif self.path.startswith("/debug/spans"):
+            tid = (parse_qs(urlparse(self.path).query).get("trace_id") or [""])[0]
+            self._send_json(200, {"spans": self.state.spans.get(tid)})
         elif self.path == "/v1/models":
             data = [{"id": m, "object": "model", "owned_by": "mockserve"} for m in MODELS]
             self._send_json(200, {"object": "list", "data": data})
@@ -165,6 +187,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- POST -----------------------------------------------------------
     def do_POST(self) -> None:
+        self.t_recv = now()
+        self.trace_id = trace_id_of(self.headers.get("traceparent"))
         length = int(self.headers.get("content-length") or 0)
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
@@ -233,6 +257,7 @@ class Handler(BaseHTTPRequestHandler):
         start = time.monotonic()
 
         if not body.get("stream"):
+            self._admit()
             time.sleep(ttft + self.state.tbt_s * len(tokens))
             self._record_tokens(len(tokens), time.monotonic() - start)
             self._send_json(200, {
@@ -241,6 +266,7 @@ class Handler(BaseHTTPRequestHandler):
                              "message": {"role": "assistant", "content": "".join(tokens)}}],
                 "usage": usage,
             })
+            self.state.spans.add(self.trace_id, "server.total", self.t_recv, now())
             return
 
         include_usage = bool((body.get("stream_options") or {}).get("include_usage")) and fault != "no-usage"
@@ -260,8 +286,12 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model}
-        time.sleep(ttft)
+        t_disp = self._admit()
+        time.sleep(ttft)                         # prefill
         emit({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
+        t_first = now()
+        self.state.spans.add(self.trace_id, "server.prefill", t_disp, t_first)
+        self.state.spans.add(self.trace_id, "server.ttfb", self.t_recv, t_first)
         for i, tok in enumerate(tokens):
             if i == 0:
                 self._record_tokens(0, time.monotonic() - start)
@@ -279,6 +309,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
         with self.state.lock:
             self.state.tokens_total += len(tokens)
+        self.state.spans.add(self.trace_id, "server.total", self.t_recv, now())
+
+    def _admit(self) -> float:
+        """Wait for the batch scheduler; record the wait as its own span. Returns dispatch time."""
+        t_enq = now()
+        waited = self.state.sched.admit()
+        t_disp = now()
+        self.state.spans.add(self.trace_id, "server.sched_wait", t_enq, t_disp, policy=self.state.sched.policy)
+        with self.state.lock:
+            self.state.sched_wait_sum += waited
+            self.state.sched_wait_count += 1
+        return t_disp
 
     def _record_tokens(self, n: int, ttft: float) -> None:
         with self.state.lock:
@@ -314,6 +356,12 @@ def main(argv: list[str] | None = None) -> int:
         ttft_ms=int(os.environ.get("MOCKSERVE_TTFT_MS", "20")),
         tbt_ms=int(os.environ.get("MOCKSERVE_TBT_MS", "2")),
         allow_faults=os.environ.get("MOCKSERVE_ALLOW_FAULTS") == "1",
+        scheduler=BatchScheduler(
+            policy=os.environ.get("MOCKSERVE_SCHEDULER", "immediate"),
+            max_batch=int(os.environ.get("MOCKSERVE_MAX_BATCH", "8")),
+            batch_wait_s=int(os.environ.get("MOCKSERVE_BATCH_WAIT_MS", "350")) / 1000,
+            idle_gap_s=int(os.environ.get("MOCKSERVE_IDLE_GAP_MS", "5")) / 1000,
+        ),
     )
     drain_s = float(os.environ.get("MOCKSERVE_DRAIN_S", "10"))
     grace_s = float(os.environ.get("MOCKSERVE_DRAIN_GRACE_S", "2"))

@@ -45,6 +45,9 @@ flowchart LR
 | Chaos (k8s) | SIGKILL one pod under load and stay within a 2% error budget | `test_pod_kill_under_load_stays_within_error_budget` |
 | Release (k8s) | `rollout restart` under load with **zero** failed requests | `test_rolling_restart_is_zero_error` |
 | Performance | p50/p99 TTFT, TBT, output tok/s, error rate, and replica count are gated by `slo/default.json` | `test_load_meets_slo`, `inferqa.loadgen` |
+| Latency attribution | W3C `traceparent` crosses client → lb → pod; every hop records spans; client TTFT splits into per-hop time that sums exactly | `test_trace_context_propagates_through_proxy`, `test_hops_are_non_negative_and_explain_ttft` |
+| Latency attribution | A ~350ms TTFT regression is traced to the server's batch scheduler (≥90% of the delta), not the network or lb | `test_350ms_gap_is_attributed_to_the_scheduler` |
+| Latency attribution | Per-hop p99 budgets (`slo/latency_budget.json`) fail the regression on `sched_wait` and pass the fix; the fix still batches bursts | `test_budget_gate_fails_regression_and_passes_fix`, `test_adaptive_fix_still_batches_bursts` |
 
 ## Failure design
 
@@ -58,14 +61,38 @@ These are failures I've seen in production inference stacks, and the config that
 | Traffic still reaches a pod after SIGTERM (Endpoints removal is async) | `preStop` 5s, then the server keeps accepting for 10s more while readiness fails, then closes its listener so late requests get connection-refused, which NGINX retries safely. `mockserve_served_while_draining_total` measures the lag | `test_late_traffic_during_drain_grace_is_served`, CI run 43620047560 (2/300 503s before the fix) |
 | A retry storm double-bills customers | `proxy-next-upstream: error timeout` only, with no `non_idempotent` | `test_midstream_failure_is_not_replayed` |
 | A node drain takes out capacity | PDB `minAvailable: 2` + topology spread | manifests |
+| TTFT jumps 350ms and nobody can say where | Per-hop spans + `inferqa.latency` decomposition and baseline diff; per-hop budgets name the owning team. The seeded cause: a fixed 350ms batch window that never fills at real concurrency. The fix: dispatch when arrivals go idle | `test_350ms_gap_is_attributed_to_the_scheduler`, `scripts/latency_demo.py` in CI |
 | A failed CI run with no clues | `scripts/collect_diagnostics.sh` dumps pods, EndpointSlices, ingress logs, and events as artifacts | CI `if: failure()` |
+
+## Latency attribution: tracing a 350ms TTFT gap
+
+End-to-end TTFT tells you a request is slow, but not where the time went. Every request carries a W3C `traceparent`. The lb and the pod each record spans, and `inferqa.latency` splits client TTFT into hops that sum exactly to the total:
+
+```
+client_network = client TTFT  − lb.ttfb       lb           = lb.ttfb − server.ttfb
+sched_wait     = server.sched_wait            prefill      = server.prefill
+server_other   = server.ttfb − sched_wait − prefill
+```
+
+The seeded regression is a scheduler change that adds a fixed 350ms batch window to improve batch fill. At 4-way concurrency the batch never fills, so every request waits the whole window (`scripts/latency_demo.py`, local run):
+
+| Scheduler | TTFT p50 | sched_wait p50 | Budget | Owner of Δ |
+|---|---|---|---|---|
+| `immediate` (baseline) | 28.6 ms | 0.0 ms | ✅ | |
+| `fixed-wait` (regression) | 386.9 ms | 354.0 ms | ❌ sched_wait p99 355 ms > 50 ms | **sched_wait, 99% of +358 ms** |
+| `adaptive` (fix) | 35.5 ms | 6.2 ms | ✅ | |
+
+The fix dispatches as soon as arrivals go quiet (5ms idle gap), so a lone request isn't held back while bursts still form batches (`test_adaptive_fix_still_batches_bursts`). CI reruns the demo and posts the table to the job summary.
+
+On a real cluster, the same split comes from the ingress-nginx access log (`$upstream_connect_time`, `$upstream_header_time`, `$request_time`) or its OpenTelemetry module, plus the serving engine's own spans.
 
 ## Run it
 
 ```bash
-make venv && make test          # 44 tests: unit + local-testbed integration (~15s)
+make venv && make test          # 62 tests: unit + local-testbed integration (~30s)
 make go                         # Go lbprobe vet + tests
 make smoke                      # testbed up → probe → Go spread gate → load + SLO gate
+.venv/bin/python scripts/latency_demo.py   # baseline → 350ms regression → fix, per-hop table
 make kind && make cluster-test  # needs docker, kind, kubectl
 ```
 
@@ -90,6 +117,7 @@ docs/TEST_PLAN.md release validation strategy
 
 ## Where this stops
 
+- Span timestamps use wall-clock time. On one host that is exact enough. Across hosts, hop math is only as good as clock sync (PTP or NTP), which is why real tracing systems record durations within each process and only stitch hops together by parent and child span.
 - The mock replica covers **platform** behaviour only. It says nothing about model quality, KV-cache pressure, or hardware-specific latency. On real hardware, swap the image and tighten `slo/` per model.
 - `testbed/lb.py` copies only the NGINX behaviour the tests assert on. Anything that depends on real ingress behaviour has a `cluster` test.
 - The cluster tests run in the CI kind job. They need Docker, kind, and kubectl, and they're skipped locally when `kubectl` is missing.

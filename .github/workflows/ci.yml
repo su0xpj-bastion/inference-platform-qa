@@ -22,6 +22,10 @@ jobs:
       - run: .venv/bin/python -m pytest --junitxml=reports/junit.xml
       - run: cd tools/lbprobe && go vet ./... && go test ./...
       - run: scripts/smoke.sh
+      - name: latency attribution demo (baseline → 350ms regression → fix)
+        run: .venv/bin/python scripts/latency_demo.py
+      - if: always()
+        run: cat reports/latency.md >> "$GITHUB_STEP_SUMMARY" || true
       - uses: actions/upload-artifact@v7
         if: always()
         with: {name: testbed-reports, path: reports/}

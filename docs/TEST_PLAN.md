@@ -36,4 +36,5 @@ Each feature gets one question per layer before any code is written:
 2. Is the problem one replica or all of them? Compare `lbprobe` output (`replicas`, `status`) with `mockserve_requests_total{code}` per replica.
 3. If it's one replica: readiness flapping? OOMKilled? Missing from EndpointSlices?
 4. If it's all replicas: ingress config (buffering, timeouts, next-upstream), DNS, or the upstream SLO itself.
-5. If streams are truncated: check `finish_reason` warnings and the missing-usage warnings in the probe report.
+5. If TTFT regressed but nothing errors: run `python -m inferqa.latency --baseline <last-good.json>`. The hop that owns the delta names the team: `lb` means ingress or networking, `sched_wait` the serving scheduler, `prefill` the model or runtime.
+6. If streams are truncated: check `finish_reason` warnings and the missing-usage warnings in the probe report.
