@@ -49,6 +49,8 @@ jobs:
       - name: cluster tests
         env: {INGRESS_URL: "http://localhost:8080"}
         run: .venv/bin/python -m pytest -m cluster tests/cluster --junitxml=reports/junit-cluster.xml -p no:cacheprovider -o addopts="" -s
+      - name: wait for rollout to settle (old pods drained and gone)
+        run: scripts/wait_settled.sh
       - name: spread gate through real ingress
         run: cd tools/lbprobe && go run . -url http://localhost:8080/v1/chat/completions -host inference.local -n 300 -c 20
       - name: diagnostics (always, so passing runs keep the drain timeline too)
