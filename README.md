@@ -7,7 +7,7 @@ Those are the parts that break when you run inference at scale, and the model te
 The same assertions run on two layers:
 
 - **Local testbed**: no Docker. Three real replica processes sit behind a proxy that copies NGINX upstream behaviour. Runs in about 15 seconds.
-- **Cluster**: kind with real ingress-nginx and the production manifests. The same tests run against EKS/staging if you point `INGRESS_URL` at it.
+- **Cluster**: kind with real ingress-nginx and the production manifests. The cluster tests take `INGRESS_URL`, so they can be pointed at EKS or staging; so far they have only run on kind in CI.
 
 ```mermaid
 flowchart LR
@@ -51,7 +51,7 @@ flowchart LR
 
 ## Failure design
 
-These are failures I've seen in production inference stacks, and the config that prevents each one:
+Common failure modes in production inference stacks, and the config that prevents each one:
 
 | What goes wrong | Prevention | Proven by |
 |---|---|---|
@@ -99,7 +99,7 @@ make kind && make cluster-test  # needs docker, kind, kubectl
 The same probe works against a real endpoint:
 
 ```bash
-CEREBRAS_API_KEY=... python -m inferqa.probe --base-url https://api.cerebras.ai/v1 --model llama3.1-8b "hello"
+CEREBRAS_API_KEY=... python -m inferqa.probe --base-url https://api.cerebras.ai/v1 --model qwen-3.8-27b "hello"
 ```
 
 ## Layout
@@ -109,7 +109,7 @@ mockserve/        OpenAI-compatible replica: SSE, usage chunk, probes, /metrics,
 testbed/lb.py     L7 proxy that copies NGINX upstream semantics (RR, max_fails/fail_timeout, next_upstream)
 inferqa/          probe (one stream + contract checks), loadgen (concurrency + SLO gate), metrics (pure math)
 tools/lbprobe/    Go load-spread probe: replica skew, status mix, p50/p99; exit 1 gates a stage
-tests/            unit/ · integration/ (local testbed) · cluster/ (kind / EKS)
+tests/            unit/ · integration/ (local testbed) · cluster/ (kind in CI; any cluster via INGRESS_URL)
 deploy/           kustomize base + kind overlay, kind config, ArgoCD Application
 .github/ Jenkinsfile   same pipeline in both: testbed → smoke → kind cluster → diagnostics on failure
 docs/TEST_PLAN.md release validation strategy
